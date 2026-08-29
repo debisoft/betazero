@@ -59,9 +59,17 @@ class TrainConfig:
     epochs: float = 3.0
     batch_size: int = 1
     grad_accum: int = 8
-    max_length: int = 1024
+    # Measured on the real corpus: prompt tokens run p50 716, p90 1723,
+    # max 2441. At 1024 the commit diff crowded the target out of the window
+    # on 37% of rows -- the preflight guard rejected 153 of 443 examples. 3072
+    # clears the longest prompt with room for the target; nothing truncates.
+    max_length: int = 3072
     warmup_ratio: float = 0.03
     seed: int = 20260829
+    #: Trades compute for activation memory. The training box shares its L4
+    #: with a serving backend holding ~3GB, and a 3072-token window at bf16 is
+    #: where activations start to matter.
+    gradient_checkpointing: bool = True
 
     heldout_fraction: float = 0.1
     #: Adapters are saved bf16, not fp32: same weights for training purposes,
@@ -132,16 +140,23 @@ def build_features(tokenizer: Any, example: dict, *, max_length: int) -> dict:
     # token -- in the conservative direction.
     target = example.get("target")
     if target and target in full_text:
-        preamble = full_text[: full_text.rindex(target)]
+        cut = full_text.rindex(target)
+        preamble = full_text[:cut]
         target_start = len(tokenizer(preamble, add_special_tokens=False)["input_ids"])
+        through_target = full_text[: cut + len(target)]
+        target_end = len(
+            tokenizer(through_target, add_special_tokens=False)["input_ids"]
+        )
     else:
         target_start = n_prompt
+        target_end = n_prompt
 
     return {
         "input_ids": input_ids,
         "labels": labels,
         "id": example.get("id"),
         "target_start": target_start,
+        "target_end": target_end,
     }
 
 
@@ -169,6 +184,19 @@ def assert_target_is_learnable(features: dict, example: dict) -> None:
             f"example {example.get('id')!r}: truncation removed the developer's "
             f"text -- only template framing remains supervised, so this row "
             f"would train on nothing"
+        )
+
+    # Requiring merely that the target *started* would accept a row whose
+    # commit message is cut off half way, teaching a truncated sentence as if
+    # it were the developer's whole thought. Nothing truncates at the default
+    # window, so demanding the complete target costs nothing and closes the
+    # gap rather than leaving it to be noticed later.
+    target_end = features.get("target_end", 0)
+    if len(features["input_ids"]) < target_end:
+        raise ValueError(
+            f"example {example.get('id')!r}: truncation cut the developer's "
+            f"text short ({len(features['input_ids'])} tokens < {target_end} "
+            f"needed); the row would teach a partial commit message"
         )
 
 
@@ -267,6 +295,14 @@ def run(config: TrainConfig) -> Path:
     )
     model.config.use_cache = False
 
+    # With every base weight frozen, the inputs to a checkpointed block do not
+    # require grad, so the recomputed activations have no grad_fn and backward
+    # fails outright. PEFT only installs the fix itself if the model is already
+    # checkpointing when it wraps, which it is not here -- Trainer turns
+    # checkpointing on afterwards. So do it explicitly, before wrapping.
+    if config.gradient_checkpointing:
+        model.enable_input_require_grads()
+
     model = get_peft_model(
         model,
         LoraConfig(
@@ -293,6 +329,10 @@ def run(config: TrainConfig) -> Path:
             learning_rate=config.learning_rate,
             warmup_ratio=config.warmup_ratio,
             bf16=torch.cuda.is_available(),
+            gradient_checkpointing=config.gradient_checkpointing,
+            # Non-reentrant checkpointing handles frozen inputs correctly and
+            # is the supported path on this stack.
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             logging_steps=10,
             save_strategy="no",
             report_to=[],
@@ -346,6 +386,7 @@ def main() -> int:
     parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
     parser.add_argument("--lora-r", type=int, default=defaults.lora_r)
     parser.add_argument("--seed", type=int, default=defaults.seed)
+    parser.add_argument("--max-length", type=int, default=defaults.max_length)
     args = parser.parse_args()
 
     run(
@@ -358,6 +399,7 @@ def main() -> int:
             lora_r=args.lora_r,
             lora_alpha=args.lora_r * 2,
             seed=args.seed,
+            max_length=args.max_length,
         )
     )
     return 0
