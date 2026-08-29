@@ -33,9 +33,13 @@ from pathlib import Path
 #: Roles SmolLM3's chat template actually renders. Anything else is dropped.
 RENDERABLE_ROLES = frozenset({"system", "user", "assistant", "tool"})
 
-#: Number of leading turns forming the prompt: the system turn and the tool
-#: turn carrying the commit.
-PROMPT_TURNS = 2
+#: The prompt is exactly these turns, in this order: the system turn and the
+#: tool turn carrying the commit. Checking mere role *membership* is not enough
+#: -- a reordered row such as (system, user) would put the developer's own text
+#: into the prompt, turning training into a copy task that no longer matches
+#: what serving sends.
+PROMPT_ROLE_SEQUENCE = ("system", "tool")
+PROMPT_TURNS = len(PROMPT_ROLE_SEQUENCE)
 
 #: Empty reasoning block. The DPO/GRPO stages wrap their preferred completion
 #: this way, so SFT teaches the same target shape rather than a second one.
@@ -63,24 +67,36 @@ def extract_target(row: dict) -> str:
     """Return the developer's own text for this row.
 
     The corpus stores it twice -- as the final user turn and as
-    `feedback.free_text`. They are required to agree: if they have drifted,
-    it is not obvious which one the model should learn, and guessing would
-    train on the wrong text silently.
+    `feedback.free_text`. Both are required to be present and to agree.
+
+    Falling back to whichever copy happens to exist would be worse than
+    failing: a row that lost one copy to corpus-generation drift would train
+    silently on the survivor, and a row whose copies had diverged would train
+    on whichever the implementation happened to prefer.
     """
     feedback = (row.get("feedback") or {}).get("free_text", "")
     user_turns = [m for m in row.get("messages") or [] if m.get("role") == "user"]
     message_copy = user_turns[-1].get("content", "") if user_turns else ""
 
-    if feedback.strip() and message_copy.strip() and feedback != message_copy:
+    missing = [
+        name
+        for name, value in (
+            ("feedback.free_text", feedback),
+            ("final user turn", message_copy),
+        )
+        if not value.strip()
+    ]
+    if missing:
+        raise CorpusError(
+            f"row {row.get('row_id')!r}: empty target ({', '.join(missing)})"
+        )
+
+    if feedback != message_copy:
         raise CorpusError(
             f"row {row.get('row_id')!r}: target copies disagree; "
             f"feedback.free_text and the final user turn must match"
         )
-
-    target = feedback or message_copy
-    if not target.strip():
-        raise CorpusError(f"row {row.get('row_id')!r}: empty target")
-    return target
+    return feedback
 
 
 def build_sft_example(row: dict, *, think_symmetry: bool = True) -> dict:
@@ -92,20 +108,30 @@ def build_sft_example(row: dict, *, think_symmetry: bool = True) -> dict:
         )
 
     prompt = [dict(turn) for turn in messages[:PROMPT_TURNS]]
-    for turn in prompt:
-        if turn.get("role") not in RENDERABLE_ROLES:
-            raise CorpusError(
-                f"row {row.get('row_id')!r}: prompt turn has role "
-                f"{turn.get('role')!r}, which the chat template drops"
-            )
+    roles = tuple(turn.get("role") for turn in prompt)
+    if roles != PROMPT_ROLE_SEQUENCE:
+        raise CorpusError(
+            f"row {row.get('row_id')!r}: prompt roles are {roles}, expected "
+            f"{PROMPT_ROLE_SEQUENCE}; a different order can put the target "
+            f"into the prompt or diverge from the serving prompt"
+        )
 
     target = extract_target(row)
     content = f"{THINK_PREFIX}{target}" if think_symmetry else target
 
-    return {
+    example = {
         "id": row.get("row_id"),
         "messages": [*prompt, {"role": "assistant", "content": content}],
     }
+    unrenderable = {
+        m["role"] for m in example["messages"] if m["role"] not in RENDERABLE_ROLES
+    }
+    if unrenderable:
+        raise CorpusError(
+            f"row {row.get('row_id')!r}: built example contains roles the chat "
+            f"template drops: {sorted(unrenderable)}"
+        )
+    return example
 
 
 def build_sft_dataset(

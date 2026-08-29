@@ -109,8 +109,35 @@ def test_empty_target_is_rejected() -> None:
 def test_unrenderable_prompt_role_is_rejected() -> None:
     row = make_row()
     row["messages"][0]["role"] = "twin"
-    with pytest.raises(CorpusError, match="drops"):
+    with pytest.raises(CorpusError, match="prompt roles"):
         build_sft_example(row)
+
+
+def test_reordered_prompt_that_would_leak_the_target_is_rejected() -> None:
+    """A (system, user) prompt puts the developer's own text into the prompt,
+    turning training into a copy task that does not match serving."""
+    row = make_row("Class Path in Manifest")
+    row["messages"] = [
+        {"role": "system", "content": "You are an AI Twin of the user."},
+        {"role": "user", "content": "Class Path in Manifest"},
+        {"role": "tool", "content": "code committed"},
+        {"role": "user", "content": "Class Path in Manifest"},
+    ]
+    with pytest.raises(CorpusError, match="into the prompt"):
+        build_sft_example(row)
+
+
+@pytest.mark.parametrize("drop", ["feedback", "message"])
+def test_a_missing_target_copy_is_rejected(drop: str) -> None:
+    """Falling back to the surviving copy would let corpus drift train
+    silently on half the contract."""
+    row = make_row("subject")
+    if drop == "feedback":
+        row["feedback"]["free_text"] = ""
+    else:
+        row["messages"][3]["content"] = ""
+    with pytest.raises(CorpusError, match="empty target"):
+        extract_target(row)
 
 
 def test_too_few_turns_is_rejected() -> None:
