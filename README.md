@@ -81,5 +81,6 @@ Early. See the [issue tracker](../../issues) for planned work and
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The cobweb2 corpus derives from a public
-repository; see the sanitiser for how it is prepared.
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The cobweb2
+corpus derives from a public repository; see the sanitiser for how it is
+prepared.
