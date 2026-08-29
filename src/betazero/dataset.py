@@ -122,6 +122,11 @@ def build_sft_example(row: dict, *, think_symmetry: bool = True) -> dict:
     example = {
         "id": row.get("row_id"),
         "messages": [*prompt, {"role": "assistant", "content": content}],
+        # The developer's text on its own, without the reasoning wrapper. The
+        # trainer needs to distinguish it from the structural tokens around it
+        # so it can tell "the target survived truncation" from "some template
+        # framing survived truncation".
+        "target": target,
     }
     unrenderable = {
         m["role"] for m in example["messages"] if m["role"] not in RENDERABLE_ROLES

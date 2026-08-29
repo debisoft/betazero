@@ -43,14 +43,18 @@ class StubTokenizer:
         return {"input_ids": ids}
 
 
+THINK = "<think> </think>"
+
+
 def make_example(target: str = "Class Path in Manifest", eid: str = "r1") -> dict:
     return {
         "id": eid,
         "messages": [
             {"role": "system", "content": "You are an AI Twin of the user."},
             {"role": "tool", "content": "code committed"},
-            {"role": "assistant", "content": target},
+            {"role": "assistant", "content": f"{THINK} {target}"},
         ],
+        "target": target,
     }
 
 
@@ -148,3 +152,37 @@ def test_run_config_records_the_run(tmp_path) -> None:
     assert payload["save_dtype"] == "bfloat16"
     assert payload["train_loss"] == 1.23
     assert payload["n_train"] == 401
+
+
+def test_truncation_that_keeps_only_framing_is_rejected() -> None:
+    """The subtler half of the guard.
+
+    A row cut after the assistant header and the `<think></think>` wrapper
+    still has unmasked tokens -- but none of them are the developer's text, so
+    it teaches structure and nothing else.
+    """
+    example = make_example("Class Path in Manifest")
+    # Cut exactly at the point where the developer's text would begin: the
+    # assistant header and think wrapper survive, the commit message does not.
+    boundary = build_features(StubTokenizer(), example, max_length=512)["target_start"]
+    features = build_features(StubTokenizer(), example, max_length=boundary)
+    assert [t for t in features["labels"] if t != IGNORE_INDEX], (
+        "precondition: framing tokens are supervised, so the naive check passes"
+    )
+    with pytest.raises(ValueError, match="truncation removed the developer"):
+        assert_target_is_learnable(features, example)
+
+
+def test_target_start_points_past_the_think_wrapper() -> None:
+    example = make_example("Class Path in Manifest")
+    features = build_features(StubTokenizer(), example, max_length=128)
+    prompt_end = next(i for i, t in enumerate(features["labels"]) if t != IGNORE_INDEX)
+    assert features["target_start"] > prompt_end, (
+        "the developer text must start after the assistant framing, not at it"
+    )
+
+
+def test_untruncated_row_passes_both_halves_of_the_guard() -> None:
+    example = make_example("Class Path in Manifest")
+    features = build_features(StubTokenizer(), example, max_length=512)
+    assert_target_is_learnable(features, example)

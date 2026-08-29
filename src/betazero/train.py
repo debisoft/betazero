@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -123,7 +124,25 @@ def build_features(tokenizer: Any, example: dict, *, max_length: int) -> dict:
     n_prompt = min(len(prompt_ids), len(input_ids))
     labels = [IGNORE_INDEX] * n_prompt + list(input_ids[n_prompt:])
 
-    return {"input_ids": input_ids, "labels": labels, "id": example.get("id")}
+    # Where the developer's own text begins, as opposed to the assistant
+    # header and the `<think></think>` wrapper that precede it. Truncation can
+    # cut the sequence after that framing but before the text itself, which
+    # leaves supervised tokens that teach nothing. Token boundaries need not
+    # land exactly on the character offset, so this is approximate by at most a
+    # token -- in the conservative direction.
+    target = example.get("target")
+    if target and target in full_text:
+        preamble = full_text[: full_text.rindex(target)]
+        target_start = len(tokenizer(preamble, add_special_tokens=False)["input_ids"])
+    else:
+        target_start = n_prompt
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "id": example.get("id"),
+        "target_start": target_start,
+    }
 
 
 def assert_target_is_learnable(features: dict, example: dict) -> None:
@@ -139,6 +158,17 @@ def assert_target_is_learnable(features: dict, example: dict) -> None:
             f"example {example.get('id')!r}: no supervised tokens -- the "
             f"assistant turn did not survive templating, so this row would "
             f"train on nothing"
+        )
+
+    # Supervised tokens alone are not enough. The assistant header and the
+    # `<think></think>` wrapper are also unmasked, so a row truncated after the
+    # framing but before the commit message would pass the check above while
+    # teaching nothing but structure.
+    if len(features["input_ids"]) <= features.get("target_start", 0):
+        raise ValueError(
+            f"example {example.get('id')!r}: truncation removed the developer's "
+            f"text -- only template framing remains supervised, so this row "
+            f"would train on nothing"
         )
 
 
@@ -185,6 +215,21 @@ def run(config: TrainConfig) -> Path:
     from betazero.dataset import build_sft_dataset, load_corpus
 
     set_seed(config.seed)
+
+    # `versions` exists so a published adapter records the stack that produced
+    # it; leaving it empty would make it decorative.
+    import peft
+    import transformers as _transformers
+
+    config.versions = {
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "transformers": _transformers.__version__,
+        "peft": peft.__version__,
+        "cuda": torch.version.cuda or "none",
+        "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+    }
+
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
