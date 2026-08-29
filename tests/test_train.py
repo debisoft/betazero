@@ -186,3 +186,31 @@ def test_untruncated_row_passes_both_halves_of_the_guard() -> None:
     example = make_example("Class Path in Manifest")
     features = build_features(StubTokenizer(), example, max_length=512)
     assert_target_is_learnable(features, example)
+
+
+#: Measured on the committed corpus with the SmolLM3-3B tokenizer: the longest
+#: prompt is 2441 tokens, and the longest prompt *plus its complete target* is
+#: 2455. Asserting against the complete example rather than the prompt alone is
+#: the point -- a window that fits every prompt can still cut a target in half.
+LONGEST_COMPLETE_EXAMPLE_TOKENS = 2455
+
+
+def test_default_context_fits_every_complete_example() -> None:
+    """At 1024 this cost 153 of 443 rows to the preflight guard."""
+    assert TrainConfig().max_length >= LONGEST_COMPLETE_EXAMPLE_TOKENS
+
+
+def test_partially_truncated_target_is_rejected() -> None:
+    """A window that admits the start of the commit message but not its end
+    would teach a truncated sentence as the developer's whole thought."""
+    example = make_example("a considerably longer commit message than usual")
+    full = build_features(StubTokenizer(), example, max_length=512)
+    mid = (full["target_start"] + full["target_end"]) // 2
+    assert full["target_start"] < mid < full["target_end"], "precondition"
+    features = build_features(StubTokenizer(), example, max_length=mid)
+    with pytest.raises(ValueError, match="cut the developer's text short"):
+        assert_target_is_learnable(features, example)
+
+
+def test_gradient_checkpointing_is_on_by_default() -> None:
+    assert TrainConfig().gradient_checkpointing is True
