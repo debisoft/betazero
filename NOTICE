@@ -16,5 +16,6 @@ limitations under the License.
 ---
 
 This project includes a training corpus derived from the public git history of
-COBWEB-ca/cobweb2 (https://github.com/COBWEB-ca/cobweb2). That corpus is
-sanitised before publication; see scripts/sanitize_corpus.py.
+COBWEB-ca/cobweb2 (https://github.com/COBWEB-ca/cobweb2), used under the terms
+of that project's own licence. The corpus is sanitised before publication; the
+repository README describes how.
