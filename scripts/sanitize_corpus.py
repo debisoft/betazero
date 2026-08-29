@@ -17,15 +17,19 @@ the developer wrote. Two things in it are still not fit to publish:
     infrastructure detail leaking into a published artifact.
 
 Targets (the commit messages BetaZero is trained to produce) are verified
-untouched: redaction must not silently rewrite training labels.
+untouched: redaction must not silently rewrite training labels. The corpus
+stores each target twice -- as `feedback.free_text` and as the final user turn,
+which is the copy the SFT builder reads -- so both are checked.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 REPO_PATH_RE = re.compile(r"^/home/[^/]+/cobweb2/?$")
@@ -88,9 +92,24 @@ def walk(node: Any, counts: dict[str, int]) -> Any:
     return node
 
 
+def target_values(row: dict) -> dict[str, str]:
+    """Every field in a row that carries the training target.
+
+    The corpus stores the commit message twice: as `feedback.free_text` and as
+    the final user turn. The SFT builder reads the *message* copy, so guarding
+    only `feedback.free_text` would leave the copy the trainer actually uses
+    unprotected, and would let the two copies drift apart silently.
+    """
+    values = {"feedback.free_text": row["feedback"]["free_text"]}
+    for index, message in enumerate(row.get("messages") or []):
+        if message.get("role") == "user":
+            values[f"messages[{index}].content"] = message.get("content", "")
+    return values
+
+
 def sanitize_row(row: dict, counts: dict[str, int]) -> dict:
     """Redact one row and canonicalise its `repo` field."""
-    target_before = row["feedback"]["free_text"]
+    before = target_values(row)
 
     cleaned = walk(row, counts)
 
@@ -100,12 +119,15 @@ def sanitize_row(row: dict, counts: dict[str, int]) -> dict:
         counts["repo_path"] = counts.get("repo_path", 0) + 1
 
     # A redaction that rewrites a training label would silently change what the
-    # model learns, so treat it as a hard failure rather than a warning.
-    if cleaned["feedback"]["free_text"] != target_before:
-        raise SystemExit(
-            f"refusing to write: redaction altered the training target of row "
-            f"{row.get('row_id')!r}"
-        )
+    # model learns, so treat it as a hard failure rather than a warning. Every
+    # target-bearing field is checked, not just one of the two copies.
+    after = target_values(cleaned)
+    for field, original in before.items():
+        if after.get(field) != original:
+            raise SystemExit(
+                f"refusing to write: redaction altered the training target "
+                f"({field}) of row {row.get('row_id')!r}"
+            )
     return cleaned
 
 
@@ -115,27 +137,44 @@ def main() -> int:
     parser.add_argument("dest", help="sanitized output path")
     args = parser.parse_args()
 
+    source = Path(args.source).resolve()
+    dest = Path(args.dest)
+
+    # Writing over the source would truncate it before the first read and
+    # destroy the only copy of the raw corpus.
+    if dest.resolve() == source:
+        raise SystemExit("refusing to run: source and dest are the same file")
+
     counts: dict[str, int] = {}
     rows_changed = 0
-    total = 0
+    cleaned_rows: list[str] = []
 
-    with (
-        open(args.source, encoding="utf-8") as src,
-        open(args.dest, "w", encoding="utf-8") as out,
-    ):
+    # Sanitise and validate every row up front. Streaming straight to the
+    # destination would leave a truncated file behind on failure, and a partial
+    # JSONL corpus is indistinguishable from a complete one.
+    with source.open(encoding="utf-8") as src:
         for line in src:
             line = line.strip()
             if not line:
                 continue
-            total += 1
             row = json.loads(line)
             before = json.dumps(row, sort_keys=True)
             cleaned = sanitize_row(row, counts)
             if json.dumps(cleaned, sort_keys=True) != before:
                 rows_changed += 1
-            out.write(json.dumps(cleaned, ensure_ascii=False) + "\n")
+            cleaned_rows.append(json.dumps(cleaned, ensure_ascii=False))
 
-    print(f"rows read:     {total}")
+    # Write to a sibling temp file and rename, so the destination is either the
+    # previous corpus or the complete new one, never a half-written mixture.
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    try:
+        tmp.write_text("".join(f"{row}\n" for row in cleaned_rows), encoding="utf-8")
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    print(f"rows read:     {len(cleaned_rows)}")
     print(f"rows modified: {rows_changed}")
     for name in sorted(counts):
         print(f"  {name:10s} {counts[name]}")

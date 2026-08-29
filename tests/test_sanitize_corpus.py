@@ -104,3 +104,46 @@ def test_clean_row_survives_untouched() -> None:
     cleaned, counts = sanitize(row)
     assert cleaned == row
     assert counts == {}
+
+
+def test_target_in_user_message_is_also_guarded() -> None:
+    """The SFT builder reads the message copy of the target, not the feedback copy.
+
+    Guarding only `feedback.free_text` would leave the copy the trainer
+    actually uses free to be rewritten. Regression test for the case where the
+    two copies have drifted apart.
+    """
+    row = make_row("no secrets", target="clean subject")
+    row["messages"][3]["content"] = "contact brad.bass@ec.gc.ca about this"
+    with pytest.raises(SystemExit, match=r"messages\[3\]\.content"):
+        sanitize(row)
+
+
+def test_refuses_to_write_over_its_own_source(tmp_path) -> None:
+    """Opening the destination truncates it; if that is the source, the raw
+    corpus is destroyed before the first read."""
+    corpus = tmp_path / "corpus.jsonl"
+    corpus.write_text(json.dumps(make_row("no secrets")) + "\n", encoding="utf-8")
+    argv = ["sanitize_corpus.py", str(corpus), str(corpus)]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit, match="same file"):
+            sanitize_corpus.main()
+    assert corpus.read_text(encoding="utf-8").strip(), "source must survive"
+
+
+def test_failure_leaves_no_partial_output(tmp_path) -> None:
+    """A row that trips the target guard must not leave a truncated corpus
+    behind: a partial JSONL file is indistinguishable from a complete one."""
+    bad = make_row("no secrets", target="ping brad.bass@ec.gc.ca")
+    source = tmp_path / "in.jsonl"
+    source.write_text(
+        json.dumps(make_row("fine")) + "\n" + json.dumps(bad) + "\n", encoding="utf-8"
+    )
+    dest = tmp_path / "out.jsonl"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sys, "argv", ["sanitize_corpus.py", str(source), str(dest)])
+        with pytest.raises(SystemExit):
+            sanitize_corpus.main()
+    assert not dest.exists(), "no partial artifact may survive a failed run"
+    assert not list(tmp_path.glob("*.tmp")), "temp file must be cleaned up"
