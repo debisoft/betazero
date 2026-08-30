@@ -12,6 +12,7 @@ import pytest
 
 from betazero.evaluate import (
     ArmResult,
+    empirical_p_value,
     paired_delta,
     paired_standard_error,
     permutation_p_value,
@@ -115,3 +116,50 @@ def test_report_round_trips(tmp_path) -> None:
     path = tmp_path / "report.json"
     write_report(summary, path)
     assert json.loads(path.read_text())["treatment"] == "betazero"
+
+
+def test_zero_paired_sem_does_not_crash_the_verdict() -> None:
+    """Six identical positive deltas give p = 2/64 (significant) and a paired
+    SEM of exactly zero. The directional branch must still render."""
+    treatment = ArmResult("betazero", run_means=[0.2] * 6)
+    control = ArmResult("base", run_means=[0.1] * 6)
+    summary = summarise(treatment, control, floor=[0.001, -0.001] * 3)
+    assert summary["permutation_p"] < 0.05, "precondition: significant"
+    assert summary["delta_over_sem"] is None, "precondition: zero spread"
+    assert "paired SE is zero" in verdict_line(summary)
+
+
+def test_report_creates_its_parent_directory(tmp_path) -> None:
+    """The write happens after three generation arms; a missing directory here
+    would discard an expensive result at the last step."""
+    treatment = ArmResult("betazero", run_means=[0.2, 0.3])
+    control = ArmResult("base", run_means=[0.1, 0.1])
+    summary = summarise(treatment, control, floor=[0.01, -0.01])
+    destination = tmp_path / "artifacts" / "nested" / "report.json"
+    write_report(summary, destination)
+    assert destination.exists()
+
+
+def test_empirical_p_uses_the_noise_floor_as_the_null() -> None:
+    """A delta the floor never reaches is rarer than one it exceeds often."""
+    floor = [0.01, -0.02, 0.015, -0.01, 0.02, -0.015]
+    big = empirical_p_value(0.5, floor)
+    small = empirical_p_value(0.001, floor)
+    assert big < small
+    assert big == pytest.approx(1 / (len(floor) + 1))
+
+
+def test_empirical_p_is_nan_without_a_floor() -> None:
+    assert empirical_p_value(0.1, []) != empirical_p_value(0.1, [])
+
+
+def test_empirical_p_resolution_is_reported() -> None:
+    """Its floor of 1/(N+1) is why it qualifies a reading rather than deciding
+    one; the summary must say so rather than leave it to be inferred."""
+    treatment = ArmResult("betazero", run_means=[0.2] * 6)
+    control = ArmResult("base", run_means=[0.1] * 6)
+    summary = summarise(treatment, control, floor=[0.001, -0.001] * 3)
+    assert summary["empirical_p_resolution_limit"] == pytest.approx(1 / 7)
+    assert (
+        summary["empirical_p_vs_noise_floor"] >= summary["empirical_p_resolution_limit"]
+    )

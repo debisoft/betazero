@@ -13,12 +13,23 @@ same prompts under the same seed each run, so their run means drift together.
 The independent standard error treats that shared drift as noise and hides real
 effects.
 
-**Prefer the exact permutation test when the arms share a per-row zero floor.**
-Targets here are short commit messages, so a great many rows score zero in
-*both* arms. That floor makes the per-row paired standard error badly behaved,
-because most pairs contribute an exact zero difference that is structural
-rather than sampled. The permutation test over run means makes no distributional
-assumption and is exact for the run counts used here.
+**Use a sign-flip permutation test over run means, and be honest about what it
+assumes.** Targets here are short commit messages, so a great many rows score
+zero in *both* arms. That floor makes the per-row paired standard error badly
+behaved, because most pairs contribute an exact zero difference that is
+structural rather than sampled. The sign-flip test avoids assuming normality,
+but it is not assumption-free: it is exact only if the paired differences are
+*symmetric about zero under the null*. The arms are not randomised -- the
+adapter is always the treatment -- so that symmetry is an assumption about the
+experiment, not a property the design enforces. It is a reasonable assumption
+for a paired design where the only difference is the adapter, and it is stated
+rather than hidden.
+
+Because it is an assumption, the report also carries an **empirical p-value**
+computed against the noise-floor arm, which is a direct sample from the null and
+needs no symmetry argument. Its resolution is limited to 1/(N+1), so it informs
+the reading rather than deciding it; the decision gate is whether the effect
+exceeds the measured noise floor at all.
 
 A noise-floor arm -- base against base under different seeds -- is reported
 alongside, so a delta can be read against how much the harness moves when
@@ -32,6 +43,9 @@ import json
 import statistics as st
 from dataclasses import dataclass, field
 from pathlib import Path
+
+#: Above this, enumerating every sign assignment stops being tractable.
+MAX_EXACT_RUNS = 20
 
 
 def _lcs_length(a: list[str], b: list[str]) -> int:
@@ -102,15 +116,16 @@ def paired_standard_error(deltas: list[float]) -> float:
 def permutation_p_value(deltas: list[float]) -> float:
     """Exact two-sided sign-flip permutation test on the run deltas.
 
-    Under the null that the adapter changes nothing, the sign of each run's
-    delta is arbitrary. Enumerating all 2^N sign assignments gives an exact
-    p-value with no distributional assumption -- which matters because the
-    per-row scores are floored at zero and are nowhere near normal.
+    Exact *given* that the paired differences are symmetric about zero under
+    the null. That symmetry is an assumption about this experiment rather than
+    something the design enforces: the adapter is always the treatment arm, so
+    the labels are never randomised. See `empirical_p_value` for the companion
+    figure that does not rely on it.
     """
     n = len(deltas)
     if n == 0:
         return float("nan")
-    if n > 20:
+    if n > MAX_EXACT_RUNS:
         raise ValueError(f"exact enumeration is 2^{n}; use fewer runs or sample")
 
     observed = abs(st.fmean(deltas))
@@ -121,6 +136,22 @@ def permutation_p_value(deltas: list[float]) -> float:
         >= observed - 1e-12
     )
     return at_least_as_extreme / 2**n
+
+
+def empirical_p_value(delta: float, floor_deltas: list[float]) -> float:
+    """Two-sided p against the harness's own null.
+
+    The noise-floor arm is the base model measured against itself, so its
+    deltas are drawn from the null directly -- no symmetry or exchangeability
+    argument required. The add-one correction keeps the estimate honest at
+    small N, which also bounds the smallest reportable value at 1/(N+1): with
+    six runs this cannot go below ~0.14, so it qualifies a reading rather than
+    deciding one.
+    """
+    if not floor_deltas:
+        return float("nan")
+    at_least_as_extreme = sum(1 for f in floor_deltas if abs(f) >= abs(delta) - 1e-12)
+    return (at_least_as_extreme + 1) / (len(floor_deltas) + 1)
 
 
 def summarise(treatment: ArmResult, control: ArmResult, floor: list[float]) -> dict:
@@ -141,6 +172,10 @@ def summarise(treatment: ArmResult, control: ArmResult, floor: list[float]) -> d
         "paired_sem": sem,
         "delta_over_sem": (delta / sem) if sem and sem == sem and sem > 0 else None,
         "permutation_p": permutation_p_value(deltas),
+        "empirical_p_vs_noise_floor": empirical_p_value(delta, floor),
+        "empirical_p_resolution_limit": (
+            1 / (len(floor) + 1) if floor else float("nan")
+        ),
         "noise_floor_mean_abs_delta": floor_spread,
         "delta_exceeds_noise_floor": (
             abs(delta) > floor_spread if floor_spread == floor_spread else None
@@ -167,14 +202,30 @@ def verdict_line(summary: dict) -> str:
             f"p={p:.3f}"
         )
     direction = "BETTER" if delta > 0 else "WORSE"
+    # A constant non-zero delta gives a paired SEM of exactly zero, which is
+    # recorded as None rather than an infinite ratio. Say so instead of
+    # formatting None as a float.
+    ratio = summary.get("delta_over_sem")
+    spread = (
+        f"{ratio:.1f}x paired SE"
+        if isinstance(ratio, (int, float))
+        else "paired SE is zero (identical run deltas)"
+    )
     return (
         f"{direction}: delta {delta:+.4f}, permutation p={p:.3f}, "
-        f"{summary['delta_over_sem']:.1f}x paired SE (n={summary['n_runs']})"
+        f"{spread} (n={summary['n_runs']})"
     )
 
 
 def write_report(summary: dict, path: str | Path) -> None:
-    Path(path).write_text(
+    """Write the report, creating the parent directory.
+
+    The write happens only after three model-generation arms have run, so a
+    missing directory here would discard an expensive result at the last step.
+    """
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
     )
 
@@ -270,6 +321,15 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=TrainConfig().seed)
     args = parser.parse_args()
 
+    # Validate before loading a model. Everything below this point costs three
+    # full generation passes, and a run count the statistics cannot summarise
+    # should not be discovered after paying for them.
+    if not 1 <= args.n_runs <= MAX_EXACT_RUNS:
+        raise SystemExit(
+            f"--n-runs must be between 1 and {MAX_EXACT_RUNS} "
+            f"(the exact permutation test enumerates 2^n); got {args.n_runs}"
+        )
+
     # The held-out split must be reproduced exactly as training made it, or the
     # evaluation is quietly scoring rows the adapter was trained on.
     config = TrainConfig(seed=args.seed)
@@ -277,6 +337,12 @@ def main() -> int:
     _, heldout = split_corpus(
         examples, heldout_fraction=config.heldout_fraction, seed=config.seed
     )
+    if not heldout:
+        raise SystemExit(
+            f"held-out split is empty ({len(examples)} examples at "
+            f"heldout_fraction={config.heldout_fraction}); there is nothing to "
+            f"evaluate on"
+        )
     print(f"held-out examples: {len(heldout)}")
 
     # Both arms share the seed sequence, so each run pairs like with like.
