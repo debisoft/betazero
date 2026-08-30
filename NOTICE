@@ -16,6 +16,14 @@ limitations under the License.
 ---
 
 This project includes a training corpus derived from the public git history of
-COBWEB-ca/cobweb2 (https://github.com/COBWEB-ca/cobweb2), used under the terms
-of that project's own licence. The corpus is sanitised before publication; the
-repository README describes how.
+COBWEB-ca/cobweb2 (https://github.com/COBWEB-ca/cobweb2). That repository
+publishes no licence, so no licence terms are claimed for the derived corpus
+here; the question is being settled directly with the upstream project.
+
+The corpus is sanitised before publication: third-party contact details that
+appear in the project's credits screen are redacted, while contributor names are
+kept, since attribution is what a credits screen is for. The repository README
+describes the process.
+
+If you hold rights in cobweb2 and have a concern about this material, please
+open an issue on this repository.
