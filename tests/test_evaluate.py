@@ -7,6 +7,7 @@ what decide whether the project claims a result. These pin them.
 from __future__ import annotations
 
 import json
+from argparse import ArgumentTypeError
 
 import pytest
 
@@ -17,6 +18,7 @@ from betazero.evaluate import (
     paired_standard_error,
     permutation_p_value,
     rouge_l,
+    run_count,
     summarise,
     verdict_line,
     write_report,
@@ -163,3 +165,16 @@ def test_empirical_p_resolution_is_reported() -> None:
     assert (
         summary["empirical_p_vs_noise_floor"] >= summary["empirical_p_resolution_limit"]
     )
+
+
+@pytest.mark.parametrize("bad", ["0", "-3", "21", "1000", "notanumber"])
+def test_run_count_rejects_unusable_values(bad: str) -> None:
+    """Rejected at parse time, so nothing is loaded and no generation pass is
+    paid for before the count is found to be unusable."""
+    with pytest.raises(ArgumentTypeError):
+        run_count(bad)
+
+
+@pytest.mark.parametrize("good", ["1", "6", "20"])
+def test_run_count_accepts_the_supported_range(good: str) -> None:
+    assert run_count(good) == int(good)

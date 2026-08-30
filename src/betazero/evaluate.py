@@ -41,11 +41,32 @@ from __future__ import annotations
 import itertools
 import json
 import statistics as st
+from argparse import ArgumentTypeError
 from dataclasses import dataclass, field
 from pathlib import Path
 
 #: Above this, enumerating every sign assignment stops being tractable.
 MAX_EXACT_RUNS = 20
+
+
+def run_count(value: str) -> int:
+    """argparse type for --n-runs.
+
+    Enforced at parse time rather than checked later, so an unusable count is
+    rejected before anything is loaded and the bound appears in --help instead
+    of only in a traceback.
+    """
+    try:
+        count = int(value)
+    except ValueError:
+        raise ArgumentTypeError(f"{value!r} is not an integer") from None
+    if not 1 <= count <= MAX_EXACT_RUNS:
+        raise ArgumentTypeError(
+            f"must be between 1 and {MAX_EXACT_RUNS}: the exact permutation "
+            f"test enumerates 2^n sign assignments, and a run count below 1 "
+            f"leaves nothing to summarise (got {count})"
+        )
+    return count
 
 
 def _lcs_length(a: list[str], b: list[str]) -> int:
@@ -316,19 +337,15 @@ def main() -> int:
     parser.add_argument("--adapter", required=True)
     parser.add_argument("--corpus", default=TrainConfig().corpus)
     parser.add_argument("--base-model", default=TrainConfig().base_model)
-    parser.add_argument("--n-runs", type=int, default=6)
+    parser.add_argument(
+        "--n-runs",
+        type=run_count,
+        default=6,
+        help=f"sampled passes per arm (1-{MAX_EXACT_RUNS})",
+    )
     parser.add_argument("--out", default="artifacts/eval_report.json")
     parser.add_argument("--seed", type=int, default=TrainConfig().seed)
     args = parser.parse_args()
-
-    # Validate before loading a model. Everything below this point costs three
-    # full generation passes, and a run count the statistics cannot summarise
-    # should not be discovered after paying for them.
-    if not 1 <= args.n_runs <= MAX_EXACT_RUNS:
-        raise SystemExit(
-            f"--n-runs must be between 1 and {MAX_EXACT_RUNS} "
-            f"(the exact permutation test enumerates 2^n); got {args.n_runs}"
-        )
 
     # The held-out split must be reproduced exactly as training made it, or the
     # evaluation is quietly scoring rows the adapter was trained on.
